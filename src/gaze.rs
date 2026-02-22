@@ -186,11 +186,13 @@ fn check_scale(
 
 // --- Preprocessing ---
 
-/// Resize RGB HWC to target CHW, normalize [0..1]
+/// Resize RGB HWC to target CHW, normalize [0..1] (1D slice access)
 fn preprocess_chw(rgb: &[u8], w: u32, h: u32, target: usize) -> Array4<f32> {
     let mut out = Array4::<f32>::zeros((1, 3, target, target));
+    let buf = out.as_slice_mut().unwrap();
     let sx = w as f32 / target as f32;
     let sy = h as f32 / target as f32;
+    let plane = target * target;
 
     for ty in 0..target {
         for tx in 0..target {
@@ -199,15 +201,16 @@ fn preprocess_chw(rgb: &[u8], w: u32, h: u32, target: usize) -> Array4<f32> {
             let src_x = src_x.min(w - 1);
             let src_y = src_y.min(h - 1);
             let idx = ((src_y * w + src_x) * 3) as usize;
-            out[[0, 0, ty, tx]] = rgb[idx] as f32 / 255.0;
-            out[[0, 1, ty, tx]] = rgb[idx + 1] as f32 / 255.0;
-            out[[0, 2, ty, tx]] = rgb[idx + 2] as f32 / 255.0;
+            let pos = ty * target + tx;
+            buf[pos] = rgb[idx] as f32 / 255.0;
+            buf[plane + pos] = rgb[idx + 1] as f32 / 255.0;
+            buf[2 * plane + pos] = rgb[idx + 2] as f32 / 255.0;
         }
     }
     out
 }
 
-/// Crop face box from RGB HWC and resize to CHW target
+/// Crop face box from RGB HWC and resize to CHW target (1D slice access)
 fn crop_and_resize_chw(
     rgb: &[u8],
     w: u32,
@@ -216,10 +219,12 @@ fn crop_and_resize_chw(
     target: usize,
 ) -> Array4<f32> {
     let mut out = Array4::<f32>::zeros((1, 3, target, target));
+    let buf = out.as_slice_mut().unwrap();
     let fx1 = face_box[0] * w as f32;
     let fy1 = face_box[1] * h as f32;
     let fw = (face_box[2] - face_box[0]) * w as f32;
     let fh = (face_box[3] - face_box[1]) * h as f32;
+    let plane = target * target;
 
     for ty in 0..target {
         for tx in 0..target {
@@ -229,9 +234,10 @@ fn crop_and_resize_chw(
             let sy = sy as i32;
             if sx >= 0 && sx < w as i32 && sy >= 0 && sy < h as i32 {
                 let idx = ((sy as u32 * w + sx as u32) * 3) as usize;
-                out[[0, 0, ty, tx]] = rgb[idx] as f32 / 255.0;
-                out[[0, 1, ty, tx]] = rgb[idx + 1] as f32 / 255.0;
-                out[[0, 2, ty, tx]] = rgb[idx + 2] as f32 / 255.0;
+                let pos = ty * target + tx;
+                buf[pos] = rgb[idx] as f32 / 255.0;
+                buf[plane + pos] = rgb[idx + 1] as f32 / 255.0;
+                buf[2 * plane + pos] = rgb[idx + 2] as f32 / 255.0;
             }
         }
     }

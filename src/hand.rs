@@ -14,7 +14,8 @@ const LANDMARK_SIZE: usize = 224;
 const SCORE_THRESH: f32 = 0.5;
 const NMS_THRESH: f32 = 0.3;
 const ROI_EXPAND: f32 = 2.9;
-const PINCH_THRESHOLD: f32 = 0.08; // normalized distance
+const ROI_TRACK_EXPAND: f32 = 2.0;
+const PINCH_RATIO_THRESH: f32 = 0.25; // pinch_dist / hand_size ratio
 
 // --- Types ---
 
@@ -66,6 +67,8 @@ pub struct HandDetector {
     palm_session: Session,
     landmark_session: Session,
     anchors: Vec<Anchor>,
+    prev_roi: Option<(f32, f32, f32)>, // (cx, cy, side) for frame-to-frame tracking
+    frame_count: u64,
 }
 
 impl HandDetector {
@@ -82,15 +85,42 @@ impl HandDetector {
             palm_session,
             landmark_session,
             anchors,
+            prev_roi: None,
+            frame_count: 0,
         })
+    }
+
+    pub fn is_tracking(&self) -> bool {
+        self.prev_roi.is_some()
     }
 
     /// Detect hands in an RGB frame (HWC, u8, 3 channels)
     pub fn detect(&mut self, rgb: &[u8], w: u32, h: u32) -> Result<Vec<HandResult>> {
+        self.frame_count += 1;
+        // Tracking: reuse previous ROI to skip palm detection
+        if let Some((cx, cy, side)) = self.prev_roi {
+            // Reset if ROI drifted off-screen
+            if cx < -0.1 || cx > 1.1 || cy < -0.1 || cy > 1.1 {
+                self.prev_roi = None;
+            } else if let Some(hand) = self.detect_landmarks_roi(rgb, w, h, cx, cy, side)? {
+                let new_roi = roi_from_landmarks(&hand.points);
+                if new_roi.0 > -0.1 && new_roi.0 < 1.1 && new_roi.1 > -0.1 && new_roi.1 < 1.1 {
+                    self.prev_roi = Some(new_roi);
+                } else {
+                    self.prev_roi = None;
+                }
+                return Ok(vec![hand]);
+            } else {
+                self.prev_roi = None;
+            }
+        }
+
         let palms = self.detect_palms(rgb, w, h)?;
         let mut results = Vec::new();
         for palm in &palms {
-            if let Some(hand) = self.detect_landmarks(rgb, w, h, palm)? {
+            let side = palm.w.max(palm.h) * ROI_EXPAND;
+            if let Some(hand) = self.detect_landmarks_roi(rgb, w, h, palm.cx, palm.cy, side)? {
+                self.prev_roi = Some(roi_from_landmarks(&hand.points));
                 results.push(hand);
             }
         }
@@ -112,29 +142,30 @@ impl HandDetector {
         let mut detections = Vec::new();
 
         for i in 0..self.anchors.len() {
-            let score = sigmoid(score_data[i]); // shape [1, 2016, 1] → flat index i
+            let score = sigmoid(score_data[i]);
             if score < SCORE_THRESH {
                 continue;
             }
             let a = &self.anchors[i];
-            // shape [1, 2016, 18] → flat index i * 18 + j
-            let cx = bbox_data[i * 18] / scale + a.cx;
-            let cy = bbox_data[i * 18 + 1] / scale + a.cy;
-            let bw = bbox_data[i * 18 + 2] / scale;
-            let bh = bbox_data[i * 18 + 3] / scale;
+
+            // MediaPipe SSD output order: [y_center, x_center, h, w, ky0, kx0, ...]
+            let cy = bbox_data[i * 18] / scale + a.cy;
+            let cx = bbox_data[i * 18 + 1] / scale + a.cx;
+            let bh = bbox_data[i * 18 + 2] / scale;
+            let bw = bbox_data[i * 18 + 3] / scale;
 
             let mut keypoints = [(0.0f32, 0.0f32); 7];
             for k in 0..7 {
                 keypoints[k] = (
-                    bbox_data[i * 18 + 4 + k * 2] / scale + a.cx,
-                    bbox_data[i * 18 + 5 + k * 2] / scale + a.cy,
+                    bbox_data[i * 18 + 4 + k * 2 + 1] / scale + a.cx, // kx
+                    bbox_data[i * 18 + 4 + k * 2] / scale + a.cy,     // ky
                 );
             }
             detections.push(PalmDetection {
                 cx,
                 cy,
-                w: bw,
-                h: bh,
+                w: bw.abs(),
+                h: bh.abs(),
                 score,
                 _keypoints: keypoints,
             });
@@ -143,18 +174,15 @@ impl HandDetector {
         Ok(nms(detections, NMS_THRESH))
     }
 
-    fn detect_landmarks(
+    fn detect_landmarks_roi(
         &mut self,
         rgb: &[u8],
         w: u32,
         h: u32,
-        palm: &PalmDetection,
+        roi_cx: f32,
+        roi_cy: f32,
+        side: f32,
     ) -> Result<Option<HandResult>> {
-        // Compute square ROI from palm, expanded by ROI_EXPAND
-        let side = palm.w.max(palm.h) * ROI_EXPAND;
-        let roi_cx = palm.cx;
-        let roi_cy = palm.cy;
-
         let input = crop_and_resize(rgb, w, h, roi_cx, roi_cy, side, LANDMARK_SIZE);
         let tensor = Tensor::from_array(input)?;
         let outputs = self
@@ -176,7 +204,7 @@ impl HandDetector {
         let roi_y1 = roi_cy - side / 2.0;
 
         for i in 0..21 {
-            // Landmark output is normalized to [0..224] within the crop
+            // Landmark output is in pixel space [0..224] within the crop
             let lx = kp_data[i * 3] / LANDMARK_SIZE as f32;
             let ly = kp_data[i * 3 + 1] / LANDMARK_SIZE as f32;
             let lz = kp_data[i * 3 + 2] / LANDMARK_SIZE as f32;
@@ -224,9 +252,10 @@ fn generate_anchors() -> Vec<Anchor> {
 
 // --- Image Preprocessing ---
 
-/// Resize RGB image to target_size × target_size, normalize to [0..1], HWC layout
+/// Resize RGB image to target×target (stretch), normalize to [0..1]
 fn preprocess_image(rgb: &[u8], w: u32, h: u32, target: usize) -> Array4<f32> {
     let mut out = Array4::<f32>::zeros((1, target, target, 3));
+    let buf = out.as_slice_mut().unwrap();
     let scale_x = w as f32 / target as f32;
     let scale_y = h as f32 / target as f32;
 
@@ -236,16 +265,17 @@ fn preprocess_image(rgb: &[u8], w: u32, h: u32, target: usize) -> Array4<f32> {
             let sy = ((ty as f32 + 0.5) * scale_y) as u32;
             let sx = sx.min(w - 1);
             let sy = sy.min(h - 1);
-            let idx = ((sy * w + sx) * 3) as usize;
-            out[[0, ty, tx, 0]] = rgb[idx] as f32 / 255.0;
-            out[[0, ty, tx, 1]] = rgb[idx + 1] as f32 / 255.0;
-            out[[0, ty, tx, 2]] = rgb[idx + 2] as f32 / 255.0;
+            let src = ((sy * w + sx) * 3) as usize;
+            let dst = (ty * target + tx) * 3;
+            buf[dst] = rgb[src] as f32 / 255.0;
+            buf[dst + 1] = rgb[src + 1] as f32 / 255.0;
+            buf[dst + 2] = rgb[src + 2] as f32 / 255.0;
         }
     }
     out
 }
 
-/// Crop a square ROI (center + side in normalized coords) and resize to target_size
+/// Crop a square ROI and resize to target_size, normalize to [0..1], HWC (1D slice access)
 fn crop_and_resize(
     rgb: &[u8],
     w: u32,
@@ -256,6 +286,7 @@ fn crop_and_resize(
     target: usize,
 ) -> Array4<f32> {
     let mut out = Array4::<f32>::zeros((1, target, target, 3));
+    let buf = out.as_slice_mut().unwrap();
     let x1 = (cx - side / 2.0) * w as f32;
     let y1 = (cy - side / 2.0) * h as f32;
     let crop_w = side * w as f32;
@@ -268,10 +299,11 @@ fn crop_and_resize(
             let sx = sx as i32;
             let sy = sy as i32;
             if sx >= 0 && sx < w as i32 && sy >= 0 && sy < h as i32 {
-                let idx = ((sy as u32 * w + sx as u32) * 3) as usize;
-                out[[0, ty, tx, 0]] = rgb[idx] as f32 / 255.0;
-                out[[0, ty, tx, 1]] = rgb[idx + 1] as f32 / 255.0;
-                out[[0, ty, tx, 2]] = rgb[idx + 2] as f32 / 255.0;
+                let src = ((sy as u32 * w + sx as u32) * 3) as usize;
+                let dst = (ty * target + tx) * 3;
+                buf[dst] = rgb[src] as f32 / 255.0;
+                buf[dst + 1] = rgb[src + 1] as f32 / 255.0;
+                buf[dst + 2] = rgb[src + 2] as f32 / 255.0;
             }
         }
     }
@@ -327,110 +359,173 @@ fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
-fn dist2d(a: (f32, f32), b: (f32, f32)) -> f32 {
-    ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt()
+// 3D distance for rotation/scale-invariant geometry
+fn dist3d(a: (f32, f32, f32), b: (f32, f32, f32)) -> f32 {
+    dist3d_sq(a, b).sqrt()
+}
+
+fn dist3d_sq(a: (f32, f32, f32), b: (f32, f32, f32)) -> f32 {
+    (a.0 - b.0).powi(2) + (a.1 - b.1).powi(2) + (a.2 - b.2).powi(2)
+}
+
+fn vec3_sub(a: (f32, f32, f32), b: (f32, f32, f32)) -> (f32, f32, f32) {
+    (a.0 - b.0, a.1 - b.1, a.2 - b.2)
+}
+
+fn vec3_dot(a: (f32, f32, f32), b: (f32, f32, f32)) -> f32 {
+    a.0 * b.0 + a.1 * b.1 + a.2 * b.2
+}
+
+fn vec3_mag_sq(v: (f32, f32, f32)) -> f32 {
+    v.0 * v.0 + v.1 * v.1 + v.2 * v.2
+}
+
+/// Angle between two 3D vectors in degrees
+fn vec3_angle_deg(a: (f32, f32, f32), b: (f32, f32, f32)) -> f32 {
+    let d = vec3_dot(a, b);
+    let m = (vec3_mag_sq(a) * vec3_mag_sq(b)).sqrt() + 1e-14;
+    (d / m).clamp(-1.0, 1.0).acos().to_degrees()
+}
+
+/// Reference hand size: wrist(0) → middle MCP(9) in 3D
+fn hand_ref_size(pts: &[(f32, f32, f32); 21]) -> f32 {
+    dist3d(pts[0], pts[9]) + 1e-7
+}
+
+fn roi_from_landmarks(pts: &[(f32, f32, f32); 21]) -> (f32, f32, f32) {
+    // Bbox center (stable) + clamped side (prevents death spiral & overshoot)
+    let (mut min_x, mut max_x) = (f32::MAX, f32::MIN);
+    let (mut min_y, mut max_y) = (f32::MAX, f32::MIN);
+    for p in pts {
+        min_x = min_x.min(p.0);
+        max_x = max_x.max(p.0);
+        min_y = min_y.min(p.1);
+        max_y = max_y.max(p.1);
+    }
+    let cx = (min_x + max_x) / 2.0;
+    let cy = (min_y + max_y) / 2.0;
+    let bbox_side = (max_x - min_x).max(max_y - min_y);
+    let side = (bbox_side * ROI_TRACK_EXPAND).clamp(0.2, 0.9);
+    (cx, cy, side)
 }
 
 fn estimate_handedness(pts: &[(f32, f32, f32); 21]) -> HandLabel {
-    // In mirrored view: compare index MCP (5) and pinky MCP (17) x-positions
-    // If index MCP is left of pinky → right hand (palm facing camera)
-    if pts[5].0 < pts[17].0 {
+    // 2D cross product of wrist→index_mcp × wrist→pinky_mcp
+    // Sign determines chirality independent of hand rotation
+    let v1 = vec3_sub(pts[5], pts[0]);  // wrist → index MCP
+    let v2 = vec3_sub(pts[17], pts[0]); // wrist → pinky MCP
+    let cross_z = v1.0 * v2.1 - v1.1 * v2.0;
+    if cross_z > 0.0 {
         HandLabel::Right
     } else {
         HandLabel::Left
     }
 }
 
-// --- Gesture Classification (ported from Python hand_tracker.py) ---
+// --- Gesture Classification (rotation/scale/depth invariant) ---
 
+/// Finger extension via PIP joint angle (2D, rotation/scale invariant).
+/// Straight finger ≈ 180°, bent finger ≈ 30-90°.
 fn finger_extended(pts: &[(f32, f32, f32); 21], tip: usize, pip: usize) -> bool {
-    pts[tip].1 < pts[pip].1
+    let mcp = pip - 1;
+    // Angle at PIP: vectors PIP→MCP and PIP→TIP
+    let v1 = (pts[mcp].0 - pts[pip].0, pts[mcp].1 - pts[pip].1);
+    let v2 = (pts[tip].0 - pts[pip].0, pts[tip].1 - pts[pip].1);
+    let dot = v1.0 * v2.0 + v1.1 * v2.1;
+    let mag = ((v1.0 * v1.0 + v1.1 * v1.1) * (v2.0 * v2.0 + v2.1 * v2.1)).sqrt() + 1e-7;
+    let angle = (dot / mag).clamp(-1.0, 1.0).acos().to_degrees();
+    angle > 130.0
 }
 
-fn is_thumb_extended(pts: &[(f32, f32, f32); 21], label: HandLabel) -> bool {
-    let tip = pts[4];
-    let ip = pts[3];
-    let mcp = pts[2];
-    let cmc = pts[1];
-    let wrist = pts[0];
+fn is_thumb_extended(pts: &[(f32, f32, f32); 21], _label: HandLabel) -> bool {
+    let hs = hand_ref_size(pts);
 
-    // Vote 1: X-direction
-    let x_ext = match label {
-        HandLabel::Right => tip.0 > ip.0,
-        HandLabel::Left => tip.0 < ip.0,
-    };
+    // Vote 1: Thumb tip protrudes from palm center (3D ratio)
+    let palm_center = (
+        (pts[0].0 + pts[5].0 + pts[17].0) / 3.0,
+        (pts[0].1 + pts[5].1 + pts[17].1) / 3.0,
+        (pts[0].2 + pts[5].2 + pts[17].2) / 3.0,
+    );
+    let is_protruding = dist3d(pts[4], palm_center) / hs > 0.45;
 
-    // Vote 2: Thumb straightness (angle at IP joint)
-    let v1x = mcp.0 - cmc.0;
-    let v1y = mcp.1 - cmc.1;
-    let v2x = tip.0 - mcp.0;
-    let v2y = tip.1 - mcp.1;
-    let dot = v1x * v2x + v1y * v2y;
-    let mag1 = (v1x * v1x + v1y * v1y).sqrt() + 1e-7;
-    let mag2 = (v2x * v2x + v2y * v2y).sqrt() + 1e-7;
-    let cos_a = (dot / (mag1 * mag2)).clamp(-1.0, 1.0);
-    let angle = cos_a.acos().to_degrees();
-    let is_straight = angle < 50.0;
+    // Vote 2: Thumb straight (angle CMC→MCP→tip < 50°, 3D vectors)
+    let is_straight = vec3_angle_deg(
+        vec3_sub(pts[2], pts[1]),
+        vec3_sub(pts[4], pts[2]),
+    ) < 50.0;
 
-    // Vote 3: Protrusion from palm center
-    let palm_cx = (wrist.0 + pts[5].0 + pts[17].0) / 3.0;
-    let palm_cy = (wrist.1 + pts[5].1 + pts[17].1) / 3.0;
-    let hand_size = dist2d((wrist.0, wrist.1), (pts[9].0, pts[9].1)) + 1e-7;
-    let tip_dist = dist2d((tip.0, tip.1), (palm_cx, palm_cy));
-    let is_protruding = tip_dist / hand_size > 0.45;
+    // Vote 3: Thumb tip farther from pinky MCP than thumb CMC (3D)
+    // — measures outward extension independent of hand rotation
+    let is_extended = dist3d(pts[4], pts[17]) > dist3d(pts[1], pts[17]);
 
-    let votes = x_ext as u8 + is_straight as u8 + is_protruding as u8;
+    let votes = is_protruding as u8 + is_straight as u8 + is_extended as u8;
     votes >= 2
 }
 
 fn is_thumbs_up(pts: &[(f32, f32, f32); 21], _label: HandLabel) -> bool {
-    // All 4 non-thumb fingers must be folded (checked by caller)
-    let tip = pts[4];
-    let mcp = pts[2];
-    let cmc = pts[1];
-    let wrist = pts[0];
-    let index_tip = pts[8];
+    let hs = hand_ref_size(pts);
 
-    let hand_size = dist2d((wrist.0, wrist.1), (pts[9].0, pts[9].1)) + 1e-7;
-
-    // Criterion 1: Thumb far from fist cluster
-    let fist_cx = (pts[8].0 + pts[12].0 + pts[16].0 + pts[20].0) / 4.0;
-    let fist_cy = (pts[8].1 + pts[12].1 + pts[16].1 + pts[20].1) / 4.0;
-    let thumb_to_fist = dist2d((tip.0, tip.1), (fist_cx, fist_cy));
-    if thumb_to_fist / hand_size < 0.50 {
+    // 1: Thumb 3D-far from curled finger tips
+    let fist_center = (
+        (pts[8].0 + pts[12].0 + pts[16].0 + pts[20].0) / 4.0,
+        (pts[8].1 + pts[12].1 + pts[16].1 + pts[20].1) / 4.0,
+        (pts[8].2 + pts[12].2 + pts[16].2 + pts[20].2) / 4.0,
+    );
+    if dist3d(pts[4], fist_center) / hs < 0.50 {
         return false;
     }
 
-    // Criterion 2: Thumb far from index (not wrapping)
-    let thumb_to_index = dist2d((tip.0, tip.1), (index_tip.0, index_tip.1));
-    if thumb_to_index / hand_size < 0.30 {
+    // 2: Thumb 3D-far from index tip (not wrapping around fist)
+    if dist3d(pts[4], pts[8]) / hs < 0.30 {
         return false;
     }
 
-    // Criterion 3: Thumb straight (angle < 60°)
-    let v1x = mcp.0 - cmc.0;
-    let v1y = mcp.1 - cmc.1;
-    let v2x = tip.0 - mcp.0;
-    let v2y = tip.1 - mcp.1;
-    let dot = v1x * v2x + v1y * v2y;
-    let mag1 = (v1x * v1x + v1y * v1y).sqrt() + 1e-7;
-    let mag2 = (v2x * v2x + v2y * v2y).sqrt() + 1e-7;
-    let cos_a = (dot / (mag1 * mag2)).clamp(-1.0, 1.0);
-    let angle = cos_a.acos().to_degrees();
-    angle < 60.0
+    // 3: Thumb straight (3D angle < 60°)
+    if vec3_angle_deg(vec3_sub(pts[2], pts[1]), vec3_sub(pts[4], pts[2])) >= 60.0 {
+        return false;
+    }
+
+    // 4: Thumb projects beyond MCP center along palm axis
+    // palm_axis: wrist(0) → MCP center (finger direction)
+    let mcp_center = (
+        (pts[5].0 + pts[9].0 + pts[13].0 + pts[17].0) / 4.0,
+        (pts[5].1 + pts[9].1 + pts[13].1 + pts[17].1) / 4.0,
+        (pts[5].2 + pts[9].2 + pts[13].2 + pts[17].2) / 4.0,
+    );
+    let palm_axis = vec3_sub(mcp_center, pts[0]);
+    let thumb_proj = vec3_dot(vec3_sub(pts[4], pts[0]), palm_axis);
+    let mcp_proj = vec3_dot(vec3_sub(mcp_center, pts[0]), palm_axis);
+    if thumb_proj < mcp_proj * 0.8 {
+        return false;
+    }
+
+    // 5: Thumb direction has upward screen component (negative Y)
+    // — "up" vs "down" inherently requires absolute reference
+    let thumb_dir = vec3_sub(pts[4], pts[1]);
+    let thumb_len = (vec3_mag_sq(thumb_dir)).sqrt() + 1e-7;
+    thumb_dir.1 / thumb_len < -0.25
 }
 
 fn is_thumbs_down(pts: &[(f32, f32, f32); 21], label: HandLabel) -> bool {
     if !is_thumb_extended(pts, label) {
         return false;
     }
-    // All other fingers must be folded (checked by caller)
-    let tip = pts[4];
-    let cmc = pts[1];
-    let dx = tip.0 - cmc.0;
-    let dy = tip.1 - cmc.1; // positive = downward
-    let angle = dy.atan2(dx.abs()).to_degrees();
-    angle > 30.0
+    let hs = hand_ref_size(pts);
+
+    // Thumb far from other finger tips (3D ratio)
+    if dist3d(pts[4], pts[8]) / hs < 0.30 {
+        return false;
+    }
+
+    // Thumb straight (3D)
+    if vec3_angle_deg(vec3_sub(pts[2], pts[1]), vec3_sub(pts[4], pts[2])) >= 60.0 {
+        return false;
+    }
+
+    // Thumb direction has downward screen component (positive Y)
+    let thumb_dir = vec3_sub(pts[4], pts[1]);
+    let thumb_len = (vec3_mag_sq(thumb_dir)).sqrt() + 1e-7;
+    thumb_dir.1 / thumb_len > 0.25
 }
 
 fn is_two_fingers(pts: &[(f32, f32, f32); 21]) -> bool {
@@ -458,8 +553,14 @@ fn classify_gesture(
     label: HandLabel,
 ) -> (Gesture, f32, f32, u8) {
     let fingers = count_fingers(pts, label);
-    let pinch_dist = dist2d((pts[4].0, pts[4].1), (pts[8].0, pts[8].1));
-    let mid_pinch = dist2d((pts[4].0, pts[4].1), (pts[12].0, pts[12].1));
+    let hs = hand_ref_size(pts);
+
+    // 3D distances for controller (absolute, used by click/drag logic)
+    let pinch_dist = dist3d(pts[4], pts[8]);
+    let mid_pinch = dist3d(pts[4], pts[12]);
+
+    // Scale-invariant ratios for gesture classification
+    let pinch_ratio = pinch_dist / hs;
 
     // Step 1: All 4 non-thumb fingers curled?
     let all_curled = [(8, 6), (12, 10), (16, 14), (20, 18)]
@@ -480,7 +581,7 @@ fn classify_gesture(
     if is_two_fingers(pts) {
         return (Gesture::TwoFingers, pinch_dist, mid_pinch, fingers);
     }
-    if pinch_dist < PINCH_THRESHOLD {
+    if pinch_ratio < PINCH_RATIO_THRESH {
         return (Gesture::Pinch, pinch_dist, mid_pinch, fingers);
     }
     if fingers >= 4 {

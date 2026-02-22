@@ -32,12 +32,26 @@ impl CameraCapture {
         self.camera.open_stream().context("Failed to open camera stream")
     }
 
-    /// Capture a frame as RGB bytes (H x W x 3)
+    /// Capture a frame as RGB bytes (H x W x 3), horizontally flipped (mirror mode)
     pub fn frame_rgb(&mut self) -> Result<(Vec<u8>, u32, u32)> {
         let frame = self.camera.frame().context("Failed to capture frame")?;
         let decoded = frame.decode_image::<RgbFormat>().context("Failed to decode frame")?;
         let (w, h) = (decoded.width(), decoded.height());
-        Ok((decoded.into_raw(), w, h))
+        let mut raw = decoded.into_raw();
+
+        // Horizontal flip (mirror) — matches MediaPipe Python cv2.flip(frame, 1)
+        for y in 0..h as usize {
+            let row_start = y * w as usize * 3;
+            for x in 0..w as usize / 2 {
+                let left = row_start + x * 3;
+                let right = row_start + (w as usize - 1 - x) * 3;
+                for c in 0..3 {
+                    raw.swap(left + c, right + c);
+                }
+            }
+        }
+
+        Ok((raw, w, h))
     }
 }
 
