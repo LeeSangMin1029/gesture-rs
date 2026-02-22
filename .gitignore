@@ -1,0 +1,27 @@
+# Rust
+target/
+
+# ONNX models (large binaries, download separately)
+models/*.onnx
+
+# ONNX Runtime DLL (download separately)
+onnxruntime.dll
+ort-*.zip
+
+# OMC
+.omc/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Misc
+*.log
+*.tmp
+.env

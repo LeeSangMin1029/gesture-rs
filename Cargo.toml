@@ -1,0 +1,37 @@
+[package]
+name = "gesture-control"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# ONNX Runtime — single runtime for all models (gaze, face, hand, speech)
+ort = { version = "2.0.0-rc.11", features = ["load-dynamic"] }
+
+# Camera capture (Windows MSMF backend)
+nokhwa = { version = "0.10", features = ["input-msmf"] }
+
+# Image processing
+image = "0.25"
+
+# Tensor operations
+ndarray = "0.17"
+
+# Async runtime + TCP for KVM
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time"] }
+
+# Serialization (KVM protocol)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+anyhow = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+codegen-units = 1
