@@ -1,23 +1,34 @@
-// KVM TCP client — sends InputEvent to KVM server
-//
-// TODO: Implement after gesture + gaze modules are working
+// KVM TCP client — sends InputEvent as JSON lines to KVM server
 
 use crate::gesture::InputEvent;
-use anyhow::Result;
+use anyhow::{Context, Result};
+use std::io::Write;
+use std::net::TcpStream;
 
-#[allow(dead_code)]
 pub struct KvmClient {
-    // stream: tokio::net::TcpStream,
+    stream: TcpStream,
 }
 
-#[allow(dead_code)]
 impl KvmClient {
-    pub async fn connect(_addr: &str) -> Result<Self> {
-        tracing::info!("KvmClient: stub (not yet implemented)");
-        Ok(Self {})
+    pub fn connect(addr: &str) -> Result<Self> {
+        let stream = TcpStream::connect(addr).context("Failed to connect to KVM server")?;
+        stream
+            .set_nodelay(true)
+            .context("Failed to set TCP_NODELAY")?;
+        tracing::info!("KVM connected to {}", addr);
+        Ok(Self { stream })
     }
 
-    pub async fn send(&mut self, _event: &InputEvent) -> Result<()> {
+    pub fn send(&mut self, event: &InputEvent) -> Result<()> {
+        let json = serde_json::to_string(event)?;
+        writeln!(self.stream, "{}", json)?;
+        Ok(())
+    }
+
+    pub fn send_batch(&mut self, events: &[InputEvent]) -> Result<()> {
+        for event in events {
+            self.send(event)?;
+        }
         Ok(())
     }
 }
