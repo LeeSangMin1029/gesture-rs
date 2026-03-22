@@ -1,0 +1,23 @@
+{
+  "yaw_center": 0.0,
+  "yaw_range": 30.0,
+  "pitch_center": 0.0,
+  "pitch_range": 20.0,
+  "monitors": [
+    {
+      "name": "left",
+      "yaw_min": -90.0,
+      "yaw_max": -15.0
+    },
+    {
+      "name": "center",
+      "yaw_min": -15.0,
+      "yaw_max": 15.0
+    },
+    {
+      "name": "right",
+      "yaw_min": 15.0,
+      "yaw_max": 90.0
+    }
+  ]
+}

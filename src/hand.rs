@@ -8,14 +8,21 @@ use anyhow::{Context, Result};
 use ndarray::Array4;
 use ort::session::Session;
 use ort::value::Tensor;
+use std::time::Instant;
+
+use crate::filter::OneEuroFilter;
 
 const PALM_SIZE: usize = 192;
 const LANDMARK_SIZE: usize = 224;
-const SCORE_THRESH: f32 = 0.5;
+const SCORE_THRESH: f32 = 0.2;
 const NMS_THRESH: f32 = 0.3;
-const ROI_EXPAND: f32 = 2.9;
-const ROI_TRACK_EXPAND: f32 = 2.0;
 const PINCH_RATIO_THRESH: f32 = 0.25; // pinch_dist / hand_size ratio
+
+// ROI parameters (tighter than MediaPipe defaults to avoid forearm inclusion)
+const PALM_ROI_SCALE: f32 = 2.0;
+const PALM_ROI_SHIFT_Y: f32 = -0.25;
+const TRACK_ROI_SCALE: f32 = 1.5;
+const TRACK_ROI_SHIFT_Y: f32 = -0.05;
 
 // --- Types ---
 
@@ -31,7 +38,7 @@ struct PalmDetection {
     w: f32,
     h: f32,
     score: f32,
-    _keypoints: [(f32, f32); 7],
+    keypoints: [(f32, f32); 7],
 }
 
 #[derive(Debug, Clone)]
@@ -61,14 +68,132 @@ impl std::fmt::Display for HandLabel {
     }
 }
 
+// --- Rotated ROI (pixel space) ---
+
+#[derive(Debug, Clone, Copy)]
+struct RotatedRoi {
+    cx_px: f32,    // center x in pixels
+    cy_px: f32,    // center y in pixels
+    size_px: f32,  // square side length in pixels
+    rotation: f32, // radians
+}
+
+fn normalize_radians(angle: f32) -> f32 {
+    let mut a = angle % (2.0 * std::f32::consts::PI);
+    if a > std::f32::consts::PI {
+        a -= 2.0 * std::f32::consts::PI;
+    } else if a < -std::f32::consts::PI {
+        a += 2.0 * std::f32::consts::PI;
+    }
+    a
+}
+
+/// Build ROI from palm detection using keypoints[0] (wrist) and keypoints[2] (middle finger MCP)
+fn roi_from_palm(palm: &PalmDetection, w: u32, h: u32) -> RotatedRoi {
+    let wf = w as f32;
+    let hf = h as f32;
+
+    // Convert keypoints to pixel space for rotation
+    let wrist_px = (palm.keypoints[0].0 * wf, palm.keypoints[0].1 * hf);
+    let mid_px = (palm.keypoints[2].0 * wf, palm.keypoints[2].1 * hf);
+
+    // Rotation: negate Y for screen→math coordinate conversion
+    let angle = normalize_radians(
+        std::f32::consts::FRAC_PI_2 - (wrist_px.1 - mid_px.1).atan2(mid_px.0 - wrist_px.0),
+    );
+
+    // Compute palm bbox in pixels, then scale
+    let bbox_w_px = palm.w * wf;
+    let bbox_h_px = palm.h * hf;
+    let size_px = bbox_w_px.max(bbox_h_px) * PALM_ROI_SCALE;
+
+    // Center in pixels with shift along rotation direction
+    let cx_px = palm.cx * wf;
+    let cy_px = palm.cy * hf;
+    let shift = size_px * PALM_ROI_SHIFT_Y;
+    let cx_px = cx_px - shift * angle.sin();
+    let cy_px = cy_px + shift * angle.cos();
+
+    RotatedRoi { cx_px, cy_px, size_px, rotation: angle }
+}
+
+/// Build ROI from tracked landmarks using wrist(0) → mean(PIP 6,10,14) for rotation
+fn roi_from_landmarks_rotated(pts: &[(f32, f32, f32); 21], w: u32, h: u32) -> RotatedRoi {
+    let wf = w as f32;
+    let hf = h as f32;
+
+    // Pixel-space rotation reference
+    let wrist_px = (pts[0].0 * wf, pts[0].1 * hf);
+    let target_x_px = (pts[6].0 + pts[10].0 + pts[14].0) / 3.0 * wf;
+    let target_y_px = (pts[6].1 + pts[10].1 + pts[14].1) / 3.0 * hf;
+    let angle = normalize_radians(
+        std::f32::consts::FRAC_PI_2 - (wrist_px.1 - target_y_px).atan2(target_x_px - wrist_px.0),
+    );
+
+    // Bounding box in pixel space
+    let (mut min_x, mut max_x) = (f32::MAX, f32::MIN);
+    let (mut min_y, mut max_y) = (f32::MAX, f32::MIN);
+    for p in pts {
+        let px = p.0 * wf;
+        let py = p.1 * hf;
+        min_x = min_x.min(px);
+        max_x = max_x.max(px);
+        min_y = min_y.min(py);
+        max_y = max_y.max(py);
+    }
+    let bbox_size_px = (max_x - min_x).max(max_y - min_y);
+    let max_dim = wf.max(hf);
+    let size_px = (bbox_size_px * TRACK_ROI_SCALE).clamp(0.2 * max_dim, 0.9 * max_dim);
+
+    let cx_px = (min_x + max_x) / 2.0;
+    let cy_px = (min_y + max_y) / 2.0;
+
+    // Shift along rotation (MediaPipe convention)
+    let shift = size_px * TRACK_ROI_SHIFT_Y;
+    let cx_px = cx_px - shift * angle.sin();
+    let cy_px = cy_px + shift * angle.cos();
+
+    RotatedRoi { cx_px, cy_px, size_px, rotation: angle }
+}
+
+// --- Per-hand tracking state ---
+
+struct TrackedHand {
+    roi: RotatedRoi,
+    filters: Vec<(OneEuroFilter, OneEuroFilter)>,
+}
+
+impl TrackedHand {
+    fn new(roi: RotatedRoi) -> Self {
+        Self {
+            roi,
+            filters: (0..21)
+                .map(|_| (OneEuroFilter::new(3.0, 0.15), OneEuroFilter::new(3.0, 0.15)))
+                .collect(),
+        }
+    }
+
+    fn smooth(&mut self, points: &mut [(f32, f32, f32); 21], t: f32) {
+        for i in 0..21 {
+            points[i].0 = self.filters[i].0.filter(t, points[i].0);
+            points[i].1 = self.filters[i].1.filter(t, points[i].1);
+        }
+    }
+}
+
+fn roi_distance(a: &RotatedRoi, b: &RotatedRoi) -> f32 {
+    ((a.cx_px - b.cx_px).powi(2) + (a.cy_px - b.cy_px).powi(2)).sqrt()
+}
+
 // --- Hand Detector ---
 
 pub struct HandDetector {
     palm_session: Session,
     landmark_session: Session,
     anchors: Vec<Anchor>,
-    prev_roi: Option<(f32, f32, f32)>, // (cx, cy, side) for frame-to-frame tracking
+    tracked: Vec<TrackedHand>,
     frame_count: u64,
+    start_time: Instant,
 }
 
 impl HandDetector {
@@ -85,45 +210,107 @@ impl HandDetector {
             palm_session,
             landmark_session,
             anchors,
-            prev_roi: None,
+            tracked: Vec::new(),
             frame_count: 0,
+            start_time: Instant::now(),
         })
     }
 
     pub fn is_tracking(&self) -> bool {
-        self.prev_roi.is_some()
+        !self.tracked.is_empty()
     }
 
-    /// Detect hands in an RGB frame (HWC, u8, 3 channels)
+    /// Detect up to 2 hands in an RGB frame (HWC, u8, 3 channels)
     pub fn detect(&mut self, rgb: &[u8], w: u32, h: u32) -> Result<Vec<HandResult>> {
         self.frame_count += 1;
-        // Tracking: reuse previous ROI to skip palm detection
-        if let Some((cx, cy, side)) = self.prev_roi {
-            // Reset if ROI drifted off-screen
-            if cx < -0.1 || cx > 1.1 || cy < -0.1 || cy > 1.1 {
-                self.prev_roi = None;
-            } else if let Some(hand) = self.detect_landmarks_roi(rgb, w, h, cx, cy, side)? {
-                let new_roi = roi_from_landmarks(&hand.points);
-                if new_roi.0 > -0.1 && new_roi.0 < 1.1 && new_roi.1 > -0.1 && new_roi.1 < 1.1 {
-                    self.prev_roi = Some(new_roi);
-                } else {
-                    self.prev_roi = None;
+        let wf = w as f32;
+        let hf = h as f32;
+        let t = self.start_time.elapsed().as_secs_f32();
+        let mut results = Vec::new();
+
+        // Take tracked hands out to avoid borrow conflicts with session methods
+        let mut prev = std::mem::take(&mut self.tracked);
+        let mut new_tracked: Vec<TrackedHand> = Vec::new();
+
+        // Step 1: Update existing tracked hands
+        for mut track in prev.drain(..) {
+            if track.roi.cx_px < 0.0 || track.roi.cx_px > wf
+                || track.roi.cy_px < 0.0 || track.roi.cy_px > hf
+            {
+                continue;
+            }
+            if let Some(mut hand) = self.detect_landmarks_roi(rgb, w, h, &track.roi)? {
+                track.smooth(&mut hand.points, t);
+                if !landmarks_in_frame(&hand.points) {
+                    continue;
                 }
-                return Ok(vec![hand]);
-            } else {
-                self.prev_roi = None;
+                let (gesture, pinch, mid_pinch, fingers) =
+                    classify_gesture(&hand.points, hand.label);
+                hand.gesture = gesture;
+                hand.pinch_dist = pinch;
+                hand.middle_pinch_dist = mid_pinch;
+                hand.finger_count = fingers;
+
+                let new_roi = roi_from_landmarks_rotated(&hand.points, w, h);
+                if new_roi.cx_px >= 0.0 && new_roi.cx_px <= wf
+                    && new_roi.cy_px >= 0.0 && new_roi.cy_px <= hf
+                {
+                    track.roi = new_roi;
+                    new_tracked.push(track);
+                    results.push(hand);
+                }
             }
         }
 
-        let palms = self.detect_palms(rgb, w, h)?;
-        let mut results = Vec::new();
-        for palm in &palms {
-            let side = palm.w.max(palm.h) * ROI_EXPAND;
-            if let Some(hand) = self.detect_landmarks_roi(rgb, w, h, palm.cx, palm.cy, side)? {
-                self.prev_roi = Some(roi_from_landmarks(&hand.points));
-                results.push(hand);
+        // Step 2: Find new hands via palm detection (up to 2 total)
+        if new_tracked.len() < 2 {
+            let palms = self.detect_palms(rgb, w, h)?;
+            for palm in &palms {
+                if new_tracked.len() >= 2 {
+                    break;
+                }
+                let roi = roi_from_palm(palm, w, h);
+                if new_tracked
+                    .iter()
+                    .any(|tr| roi_distance(&roi, &tr.roi) < tr.roi.size_px * 0.5)
+                {
+                    continue;
+                }
+                if let Some(mut hand) = self.detect_landmarks_roi(rgb, w, h, &roi)? {
+                    let lm_roi = roi_from_landmarks_rotated(&hand.points, w, h);
+                    let mut track = TrackedHand::new(lm_roi);
+                    track.smooth(&mut hand.points, t);
+                    new_tracked.push(track);
+                    results.push(hand);
+                }
             }
         }
+
+        // Step 3: Scan fallback — catches back-of-hand and far-distance cases
+        if new_tracked.len() < 2 {
+            let scan_rois = [
+                RotatedRoi { cx_px: wf * 0.5, cy_px: hf * 0.5, size_px: hf * 0.7, rotation: 0.0 },
+                RotatedRoi { cx_px: wf * 0.3, cy_px: hf * 0.5, size_px: hf * 0.5, rotation: 0.0 },
+                RotatedRoi { cx_px: wf * 0.7, cy_px: hf * 0.5, size_px: hf * 0.5, rotation: 0.0 },
+                RotatedRoi { cx_px: wf * 0.5, cy_px: hf * 0.5, size_px: hf * 0.35, rotation: 0.0 },
+            ];
+            let idx = self.frame_count as usize % scan_rois.len();
+            let scan_roi = &scan_rois[idx];
+            let far_enough = new_tracked
+                .iter()
+                .all(|tr| roi_distance(scan_roi, &tr.roi) >= tr.roi.size_px * 0.5);
+            if far_enough {
+                if let Some(mut hand) = self.detect_landmarks_roi(rgb, w, h, scan_roi)? {
+                    let lm_roi = roi_from_landmarks_rotated(&hand.points, w, h);
+                    let mut track = TrackedHand::new(lm_roi);
+                    track.smooth(&mut hand.points, t);
+                    new_tracked.push(track);
+                    results.push(hand);
+                }
+            }
+        }
+
+        self.tracked = new_tracked;
         Ok(results)
     }
 
@@ -140,6 +327,14 @@ impl HandDetector {
 
         let scale = PALM_SIZE as f32;
         let mut detections = Vec::new();
+
+        // Debug: log max score every 30 frames
+        if self.frame_count % 30 == 0 {
+            let max_score = (0..self.anchors.len())
+                .map(|i| sigmoid(score_data[i]))
+                .fold(0.0f32, f32::max);
+            tracing::debug!("Palm max_score={:.4}", max_score);
+        }
 
         for i in 0..self.anchors.len() {
             let score = sigmoid(score_data[i]);
@@ -167,7 +362,7 @@ impl HandDetector {
                 w: bw.abs(),
                 h: bh.abs(),
                 score,
-                _keypoints: keypoints,
+                keypoints,
             });
         }
 
@@ -179,11 +374,9 @@ impl HandDetector {
         rgb: &[u8],
         w: u32,
         h: u32,
-        roi_cx: f32,
-        roi_cy: f32,
-        side: f32,
+        roi: &RotatedRoi,
     ) -> Result<Option<HandResult>> {
-        let input = crop_and_resize(rgb, w, h, roi_cx, roi_cy, side, LANDMARK_SIZE);
+        let (input, inv_affine) = affine_crop(rgb, w, h, roi, LANDMARK_SIZE);
         let tensor = Tensor::from_array(input)?;
         let outputs = self
             .landmark_session
@@ -194,23 +387,12 @@ impl HandDetector {
         let (_, conf_data) = outputs["Identity_1"].try_extract_tensor::<f32>()?;
         let confidence = sigmoid(conf_data[0]);
 
-        if confidence < 0.5 {
+        if confidence < 0.65 {
             return Ok(None);
         }
 
-        // Parse 21 keypoints and map back to original frame coordinates
-        let mut points = [(0.0f32, 0.0f32, 0.0f32); 21];
-        let roi_x1 = roi_cx - side / 2.0;
-        let roi_y1 = roi_cy - side / 2.0;
-
-        for i in 0..21 {
-            // Landmark output is in pixel space [0..224] within the crop
-            let lx = kp_data[i * 3] / LANDMARK_SIZE as f32;
-            let ly = kp_data[i * 3 + 1] / LANDMARK_SIZE as f32;
-            let lz = kp_data[i * 3 + 2] / LANDMARK_SIZE as f32;
-            // Map back to original frame [0..1]
-            points[i] = (roi_x1 + lx * side, roi_y1 + ly * side, lz);
-        }
+        // Map landmarks back to original frame via inverse affine
+        let points = transform_landmarks(&kp_data, &inv_affine, w, h, LANDMARK_SIZE);
 
         // Determine handedness from wrist-to-middle-finger direction
         let label = estimate_handedness(&points);
@@ -228,6 +410,7 @@ impl HandDetector {
             finger_count: fingers,
         }))
     }
+
 }
 
 // --- Anchor Generation ---
@@ -252,7 +435,7 @@ fn generate_anchors() -> Vec<Anchor> {
 
 // --- Image Preprocessing ---
 
-/// Resize RGB image to target×target (stretch), normalize to [0..1]
+/// Resize RGB image to target×target (stretch), normalize to [-1..1]
 fn preprocess_image(rgb: &[u8], w: u32, h: u32, target: usize) -> Array4<f32> {
     let mut out = Array4::<f32>::zeros((1, target, target, 3));
     let buf = out.as_slice_mut().unwrap();
@@ -267,37 +450,56 @@ fn preprocess_image(rgb: &[u8], w: u32, h: u32, target: usize) -> Array4<f32> {
             let sy = sy.min(h - 1);
             let src = ((sy * w + sx) * 3) as usize;
             let dst = (ty * target + tx) * 3;
-            buf[dst] = rgb[src] as f32 / 255.0;
-            buf[dst + 1] = rgb[src + 1] as f32 / 255.0;
-            buf[dst + 2] = rgb[src + 2] as f32 / 255.0;
+            buf[dst] = rgb[src] as f32 / 127.5 - 1.0;
+            buf[dst + 1] = rgb[src + 1] as f32 / 127.5 - 1.0;
+            buf[dst + 2] = rgb[src + 2] as f32 / 127.5 - 1.0;
         }
     }
     out
 }
 
-/// Crop a square ROI and resize to target_size, normalize to [0..1], HWC (1D slice access)
-fn crop_and_resize(
+/// Rotation-aware affine crop: extract rotated square ROI into target×target
+/// Returns (tensor, inverse_affine_matrix) for landmark coordinate back-projection
+fn affine_crop(
     rgb: &[u8],
     w: u32,
     h: u32,
-    cx: f32,
-    cy: f32,
-    side: f32,
+    roi: &RotatedRoi,
     target: usize,
-) -> Array4<f32> {
+) -> (Array4<f32>, [f32; 6]) {
     let mut out = Array4::<f32>::zeros((1, target, target, 3));
     let buf = out.as_slice_mut().unwrap();
-    let x1 = (cx - side / 2.0) * w as f32;
-    let y1 = (cy - side / 2.0) * h as f32;
-    let crop_w = side * w as f32;
-    let crop_h = side * h as f32;
+
+    // Compute square ROI corners directly in pixel space
+    let half = roi.size_px / 2.0;
+    let (sin_r, cos_r) = roi.rotation.sin_cos();
+    let offsets = [(-half, -half), (half, -half), (half, half), (-half, half)];
+    let mut corners = [(0.0f32, 0.0f32); 4];
+    for (i, &(dx, dy)) in offsets.iter().enumerate() {
+        corners[i] = (
+            roi.cx_px + dx * cos_r - dy * sin_r,
+            roi.cy_px + dx * sin_r + dy * cos_r,
+        );
+    }
+
+    let c0 = corners[0]; // top-left
+    let c1 = corners[1]; // top-right
+    let c3 = corners[3]; // bottom-left
+
+    // Affine basis vectors: how to step through the source image
+    let t = target as f32;
+    let ax = (c1.0 - c0.0) / t;
+    let ay = (c1.1 - c0.1) / t;
+    let bx = (c3.0 - c0.0) / t;
+    let by = (c3.1 - c0.1) / t;
 
     for ty in 0..target {
         for tx in 0..target {
-            let sx = x1 + (tx as f32 + 0.5) / target as f32 * crop_w;
-            let sy = y1 + (ty as f32 + 0.5) / target as f32 * crop_h;
-            let sx = sx as i32;
-            let sy = sy as i32;
+            let px = (tx as f32 + 0.5) * ax + (ty as f32 + 0.5) * bx + c0.0;
+            let py = (tx as f32 + 0.5) * ay + (ty as f32 + 0.5) * by + c0.1;
+
+            let sx = px as i32;
+            let sy = py as i32;
             if sx >= 0 && sx < w as i32 && sy >= 0 && sy < h as i32 {
                 let src = ((sy as u32 * w + sx as u32) * 3) as usize;
                 let dst = (ty * target + tx) * 3;
@@ -307,7 +509,36 @@ fn crop_and_resize(
             }
         }
     }
-    out
+
+    // Forward affine: maps model coords [0..target] → source image pixels
+    let inv = [ax, bx, c0.0, ay, by, c0.1];
+
+    (out, inv)
+}
+
+/// Map landmark coordinates from model output space back to normalized frame coords
+fn transform_landmarks(
+    kp_data: &[f32],
+    inv_affine: &[f32; 6],
+    w: u32,
+    h: u32,
+    target: usize,
+) -> [(f32, f32, f32); 21] {
+    let mut points = [(0.0f32, 0.0f32, 0.0f32); 21];
+    let t = target as f32;
+    for i in 0..21 {
+        let lx = kp_data[i * 3];
+        let ly = kp_data[i * 3 + 1];
+        let lz = kp_data[i * 3 + 2] / t;
+
+        // Apply inverse affine to get source image pixel coords
+        let src_x = inv_affine[0] * lx + inv_affine[1] * ly + inv_affine[2];
+        let src_y = inv_affine[3] * lx + inv_affine[4] * ly + inv_affine[5];
+
+        // Normalize to [0..1]
+        points[i] = (src_x / w as f32, src_y / h as f32, lz);
+    }
+    points
 }
 
 // --- NMS ---
@@ -392,21 +623,13 @@ fn hand_ref_size(pts: &[(f32, f32, f32); 21]) -> f32 {
     dist3d(pts[0], pts[9]) + 1e-7
 }
 
-fn roi_from_landmarks(pts: &[(f32, f32, f32); 21]) -> (f32, f32, f32) {
-    // Bbox center (stable) + clamped side (prevents death spiral & overshoot)
-    let (mut min_x, mut max_x) = (f32::MAX, f32::MIN);
-    let (mut min_y, mut max_y) = (f32::MAX, f32::MIN);
-    for p in pts {
-        min_x = min_x.min(p.0);
-        max_x = max_x.max(p.0);
-        min_y = min_y.min(p.1);
-        max_y = max_y.max(p.1);
-    }
-    let cx = (min_x + max_x) / 2.0;
-    let cy = (min_y + max_y) / 2.0;
-    let bbox_side = (max_x - min_x).max(max_y - min_y);
-    let side = (bbox_side * ROI_TRACK_EXPAND).clamp(0.2, 0.9);
-    (cx, cy, side)
+/// Reject detection if fewer than 16 of 21 landmarks fall within [0..1]
+fn landmarks_in_frame(pts: &[(f32, f32, f32); 21]) -> bool {
+    let count = pts
+        .iter()
+        .filter(|p| p.0 >= 0.0 && p.0 <= 1.0 && p.1 >= 0.0 && p.1 <= 1.0)
+        .count();
+    count >= 16
 }
 
 fn estimate_handedness(pts: &[(f32, f32, f32); 21]) -> HandLabel {
@@ -562,12 +785,13 @@ fn classify_gesture(
     // Scale-invariant ratios for gesture classification
     let pinch_ratio = pinch_dist / hs;
 
-    // Step 1: All 4 non-thumb fingers curled?
-    let all_curled = [(8, 6), (12, 10), (16, 14), (20, 18)]
+    // Step 1: Mostly curled? (3+ of 4 non-thumb fingers curled = fist family)
+    let curled_count = [(8, 6), (12, 10), (16, 14), (20, 18)]
         .iter()
-        .all(|&(t, p)| !finger_extended(pts, t, p));
+        .filter(|&&(t, p)| !finger_extended(pts, t, p))
+        .count();
 
-    if all_curled {
+    if curled_count >= 3 {
         if is_thumbs_up(pts, label) {
             return (Gesture::ThumbsUp, pinch_dist, mid_pinch, fingers);
         }

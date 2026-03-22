@@ -7,8 +7,8 @@ use nokhwa::utils::{
 };
 use nokhwa::Camera;
 
-pub const FRAME_W: u32 = 640;
-pub const FRAME_H: u32 = 480;
+pub const FRAME_W: u32 = 1280;
+pub const FRAME_H: u32 = 720;
 
 pub struct CameraCapture {
     camera: Camera,
